@@ -140,7 +140,45 @@ export function parse(content: string): HSnippet[] {
 
   // for some reason, `require` is not defined inside the snippet code blocks,
   // so we're going to bind the it onto the function
-  let generators = new Function('require', script.join('\n'))(require) as IHSnippetParseResult[];
+  let generators: IHSnippetParseResult[];
+  try {
+    // Create a safer require function that handles module loading errors
+    const safeRequire = (moduleName: string) => {
+      try {
+        return require(moduleName);
+      } catch (error) {
+        console.warn(`[HSnips] Could not require module '${moduleName}':`, error);
+        return null;
+      }
+    };
+    
+    // Wrap the user's global code in a try-catch to provide better error context
+    const wrappedScript = script.join('\n');
+    
+    // Create the execution function with safer require
+    const executionFunction = new Function('require', wrappedScript);
+    generators = executionFunction(safeRequire) as IHSnippetParseResult[];
+  } catch (error) {
+    console.error('[HSnips] Error executing snippet code:', error);
+    
+    // Provide more specific and helpful error messages
+    let errorMessage = error instanceof Error ? error.message : String(error);
+    
+    if (errorMessage.includes('has already been declared')) {
+      errorMessage = `Variable redeclaration detected in global block. Please check for duplicate variable declarations like 'let', 'const', or 'var' statements. Original error: ${errorMessage}`;
+    } else if (errorMessage.includes('Cannot read properties of undefined')) {
+      if (errorMessage.includes('document')) {
+        errorMessage = `Trying to access 'document' property of undefined. This usually happens when 'vscode.window.activeTextEditor' is null (no active editor). Consider adding null checks: 'let editor = vscode.window.activeTextEditor; if (editor) { let document = editor.document; }'. Original error: ${errorMessage}`;
+      } else {
+        errorMessage = `Accessing property of undefined object. This often happens when variables are not properly initialized or when VS Code objects are not available during parsing. Original error: ${errorMessage}`;
+      }
+    } else if (errorMessage.includes('is not defined')) {
+      errorMessage = `Undefined variable detected. Make sure all variables used in your snippets are properly declared in the global block. Original error: ${errorMessage}`;
+    }
+    
+    throw new Error(`Failed to parse snippet code: ${errorMessage}`);
+  }
+  
   return snippetInfos.map(
     (s, i) => new HSnippet(s.header, generators[i].generatorFunction, generators[i].contextFilter)
   );

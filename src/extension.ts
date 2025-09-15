@@ -47,16 +47,30 @@ async function loadSnippets(context: vscode.ExtensionContext, retryCount = 0) {
 
     for (let file of hsnipFiles) {
       try {
+        console.log(`[HSnips] Processing file: ${file}`);
         let filePath = path.join(snippetDirPath, file);
         let fileData = readFileSync(filePath, 'utf8');
         let language = path.basename(file, '.hsnips').toLowerCase();
 
+        console.log(`[HSnips] Parsing snippets for language: ${language}`);
         const snippets = parse(fileData);
         SNIPPETS_BY_LANGUAGE.set(language, snippets);
-        console.log(`[HSnips] Loaded ${snippets.length} snippets from ${file} for language: ${language}`);
+        console.log(`[HSnips] Successfully loaded ${snippets.length} snippets from ${file} for language: ${language}`);
       } catch (error) {
         console.error(`[HSnips] Error loading snippet file ${file}:`, error);
-        vscode.window.showErrorMessage(`Failed to load snippet file ${file}: ${error}`);
+        
+        // 提供更详细的错误信息
+        let errorMessage = 'Unknown error';
+        if (error instanceof Error) {
+          errorMessage = error.message;
+          
+          // 如果是 document 相关错误，提供特定的提示
+          if (errorMessage.includes('document') || errorMessage.includes('Cannot read properties of undefined')) {
+            errorMessage = `JavaScript code in snippet file contains references to undefined variables (like 'document'). Please check your global blocks and snippet code. Original error: ${errorMessage}`;
+          }
+        }
+        
+        vscode.window.showErrorMessage(`Failed to load snippet file ${file}: ${errorMessage}`);
       }
     }
 

@@ -91,8 +91,17 @@ export function getCompletions(
   }
 
   for (let snippet of snippets) {
-    if (snippet.contextFilter && !snippet.contextFilter(snippetContext)) {
-      continue;
+    // 安全执行 contextFilter
+    if (snippet.contextFilter) {
+      try {
+        if (!snippet.contextFilter(snippetContext)) {
+          continue;
+        }
+      } catch (error) {
+        console.warn(`[HSnips] Error executing context filter for snippet "${snippet.description}":`, error);
+        // 如果 contextFilter 执行失败，跳过这个 snippet
+        continue;
+      }
     }
 
     let snippetMatches = false;
