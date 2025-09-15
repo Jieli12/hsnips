@@ -49,6 +49,14 @@ export class HSnippetInstance {
     position: vscode.Position,
     matchGroups: string[]
   ) {
+    // 验证 editor 和 document 的有效性
+    if (!editor) {
+      throw new Error('HSnippetInstance: editor is required but was undefined');
+    }
+    if (!editor.document) {
+      throw new Error('HSnippetInstance: editor.document is required but was undefined');
+    }
+
     this.type = type;
     this.editor = editor;
     this.matchGroups = matchGroups;
@@ -123,6 +131,11 @@ export class HSnippetInstance {
     // TODO, update parser so only the block that threw the error does not expand, perhaps replace
     // the block with the error message.
     try {
+      // 验证 editor 和 document 的有效性
+      if (!this.editor || !this.editor.document) {
+        throw new Error('Editor or document is not available');
+      }
+
       generatorResult = this.type.generator(
         new Proxy(placeholderContents || [], {
           get(target, key) {
@@ -138,6 +151,7 @@ export class HSnippetInstance {
       );
     } catch (e: unknown) {
       if (e instanceof Error) {
+        console.error('[HSnips] Error in runCodeBlocks:', e);
         vscode.window.showWarningMessage(
           `Snippet ${this.type.description} failed to expand with error: ${e.message}`
         );
@@ -240,6 +254,12 @@ export class HSnippetInstance {
 
     if (this.blockChanged) this.blockChanged = false;
     if (!changedPlaceholders.length) return;
+
+    // 验证 editor 和 document 的有效性
+    if (!this.editor || !this.editor.document) {
+      console.error('[HSnips] Editor or document not available in update method');
+      return;
+    }
 
     changedPlaceholders.forEach((p) => (p.content = this.editor.document.getText(p.range.range)));
     let placeholderContents = this.parts

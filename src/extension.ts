@@ -13,42 +13,151 @@ const SNIPPETS_BY_LANGUAGE: Map<string, HSnippet[]> = new Map();
 const SNIPPET_STACK: HSnippetInstance[] = [];
 
 let insertingSnippet = false;
+let snippetDirWatcher: vscode.FileSystemWatcher | undefined;
+let loadSnippetsTimeout: NodeJS.Timeout | undefined;
 
-async function loadSnippets(context: vscode.ExtensionContext) {
-  SNIPPETS_BY_LANGUAGE.clear();
+/**
+ * 加载snippet文件，增强错误处理和日志记录
+ * @param context VS Code扩展上下文
+ * @param retryCount 重试次数，用于处理依赖扩展未就绪的情况
+ */
+async function loadSnippets(context: vscode.ExtensionContext, retryCount = 0) {
+  try {
+    console.log(`[HSnips] Loading snippets... (attempt ${retryCount + 1})`);
+    SNIPPETS_BY_LANGUAGE.clear();
 
-  const snippetDirInfo = getSnippetDirInfo(context);
-  if (snippetDirInfo === null) {
-    return;
-  }
-
-  const snippetDirPath = snippetDirInfo.path;
-
-  if (!existsSync(snippetDirPath)) {
-    mkdirSync(snippetDirPath, { recursive: true });
-  }
-
-  for (let file of readdirSync(snippetDirPath)) {
-    if (path.extname(file).toLowerCase() != '.hsnips') continue;
-
-    let filePath = path.join(snippetDirPath, file);
-    let fileData = readFileSync(filePath, 'utf8');
-
-    let language = path.basename(file, '.hsnips').toLowerCase();
-
-    SNIPPETS_BY_LANGUAGE.set(language, parse(fileData));
-  }
-
-  let globalSnippets = SNIPPETS_BY_LANGUAGE.get('all');
-  if (globalSnippets) {
-    for (let [language, snippetList] of SNIPPETS_BY_LANGUAGE.entries()) {
-      if (language != 'all') snippetList.push(...globalSnippets);
+    const snippetDirInfo = getSnippetDirInfo(context);
+    if (snippetDirInfo === null) {
+      console.log('[HSnips] No snippet directory info available');
+      return;
     }
+
+    const snippetDirPath = snippetDirInfo.path;
+    console.log(`[HSnips] Snippet directory: ${snippetDirPath}`);
+
+    if (!existsSync(snippetDirPath)) {
+      console.log(`[HSnips] Creating snippet directory: ${snippetDirPath}`);
+      mkdirSync(snippetDirPath, { recursive: true });
+    }
+
+    const files = readdirSync(snippetDirPath);
+    const hsnipFiles = files.filter(file => path.extname(file).toLowerCase() === '.hsnips');
+
+    console.log(`[HSnips] Found ${hsnipFiles.length} .hsnips files: ${hsnipFiles.join(', ')}`);
+
+    for (let file of hsnipFiles) {
+      try {
+        let filePath = path.join(snippetDirPath, file);
+        let fileData = readFileSync(filePath, 'utf8');
+        let language = path.basename(file, '.hsnips').toLowerCase();
+
+        const snippets = parse(fileData);
+        SNIPPETS_BY_LANGUAGE.set(language, snippets);
+        console.log(`[HSnips] Loaded ${snippets.length} snippets from ${file} for language: ${language}`);
+      } catch (error) {
+        console.error(`[HSnips] Error loading snippet file ${file}:`, error);
+        vscode.window.showErrorMessage(`Failed to load snippet file ${file}: ${error}`);
+      }
+    }
+
+    let globalSnippets = SNIPPETS_BY_LANGUAGE.get('all');
+    if (globalSnippets) {
+      console.log(`[HSnips] Applying ${globalSnippets.length} global snippets to all languages`);
+      for (let [language, snippetList] of SNIPPETS_BY_LANGUAGE.entries()) {
+        if (language !== 'all') snippetList.push(...globalSnippets);
+      }
+    }
+
+    // Sort snippets by descending priority.
+    for (let snippetList of SNIPPETS_BY_LANGUAGE.values()) {
+      snippetList.sort((a, b) => b.priority - a.priority);
+    }
+
+    console.log(`[HSnips] Successfully loaded snippets for ${SNIPPETS_BY_LANGUAGE.size} languages`);
+
+    // 设置文件系统监视器
+    setupSnippetDirWatcher(context, snippetDirPath);
+
+  } catch (error) {
+    console.error('[HSnips] Error in loadSnippets:', error);
+
+    // 如果是依赖扩展未就绪，尝试重试
+    if (retryCount < 3 && error instanceof Error &&
+      (error.message.includes('hscopes') || error.message.includes('extension'))) {
+      console.log(`[HSnips] Retrying snippet loading in 1 second (attempt ${retryCount + 1})`);
+
+      // 清除之前的超时
+      if (loadSnippetsTimeout) {
+        clearTimeout(loadSnippetsTimeout);
+      }
+
+      loadSnippetsTimeout = setTimeout(() => {
+        loadSnippets(context, retryCount + 1);
+      }, 1000);
+      return;
+    }
+
+    vscode.window.showErrorMessage(`Failed to load HSnips: ${error}`);
+  }
+}
+
+/**
+ * 设置snippet目录的文件系统监视器
+ * @param context VS Code扩展上下文
+ * @param snippetDirPath snippet目录路径
+ */
+function setupSnippetDirWatcher(context: vscode.ExtensionContext, snippetDirPath: string) {
+  // 清理之前的监视器
+  if (snippetDirWatcher) {
+    snippetDirWatcher.dispose();
   }
 
-  // Sort snippets by descending priority.
-  for (let snippetList of SNIPPETS_BY_LANGUAGE.values()) {
-    snippetList.sort((a, b) => b.priority - a.priority);
+  try {
+    // 创建监视器，监视.hsnips文件的变化
+    const pattern = new vscode.RelativePattern(snippetDirPath, '*.hsnips');
+    snippetDirWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+
+    // 文件创建事件
+    snippetDirWatcher.onDidCreate((uri) => {
+      console.log(`[HSnips] New snippet file created: ${uri.fsPath}`);
+      vscode.window.showInformationMessage(`HSnips: New snippet file detected - ${path.basename(uri.fsPath)}`);
+      loadSnippets(context);
+    });
+
+    // 文件删除事件
+    snippetDirWatcher.onDidDelete((uri) => {
+      console.log(`[HSnips] Snippet file deleted: ${uri.fsPath}`);
+      vscode.window.showInformationMessage(`HSnips: Snippet file removed - ${path.basename(uri.fsPath)}`);
+      loadSnippets(context);
+    });
+
+    // 文件修改事件
+    snippetDirWatcher.onDidChange((uri) => {
+      console.log(`[HSnips] Snippet file changed: ${uri.fsPath}`);
+      loadSnippets(context);
+    });
+
+    // 将监视器添加到订阅列表中，确保扩展卸载时清理
+    context.subscriptions.push(snippetDirWatcher);
+
+    console.log(`[HSnips] File system watcher set up for: ${snippetDirPath}`);
+  } catch (error) {
+    console.error('[HSnips] Failed to setup file system watcher:', error);
+  }
+}
+
+/**
+ * 清理资源
+ */
+function cleanup() {
+  if (snippetDirWatcher) {
+    snippetDirWatcher.dispose();
+    snippetDirWatcher = undefined;
+  }
+
+  if (loadSnippetsTimeout) {
+    clearTimeout(loadSnippetsTimeout);
+    loadSnippetsTimeout = undefined;
   }
 }
 
@@ -61,6 +170,18 @@ export async function expandSnippet(
   editor: vscode.TextEditor,
   snippetExpansion = false
 ) {
+  // 验证 editor 和 document 的有效性
+  if (!editor) {
+    console.error('[HSnips] expandSnippet: editor is undefined');
+    vscode.window.showErrorMessage('HSnips: No active editor found');
+    return;
+  }
+  if (!editor.document) {
+    console.error('[HSnips] expandSnippet: editor.document is undefined');
+    vscode.window.showErrorMessage('HSnips: No active document found');
+    return;
+  }
+
   let snippetInstance = new HSnippetInstance(
     completion.snippet,
     editor,
@@ -94,32 +215,83 @@ export async function expandSnippet(
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  vscode.extensions.getExtension('draivin.hscopes')?.activate();
+  console.log('[HSnips] Activating HyperSnips extension...');
 
-  // migrating from the old, hardcoded directory to the new one. TODO: remove this at some point
+  // 激活依赖扩展
+  const hscopesExtension = vscode.extensions.getExtension('draivin.hscopes');
+  if (hscopesExtension) {
+    hscopesExtension.activate().then(() => {
+      console.log('[HSnips] hscopes extension activated successfully');
+    }, (error) => {
+      console.error('[HSnips] Failed to activate hscopes extension:', error);
+    });
+  } else {
+    console.warn('[HSnips] hscopes extension not found');
+  }
+
+  // 迁移旧目录
   const oldGlobalSnippetDir = getOldGlobalSnippetDir();
   if (existsSync(oldGlobalSnippetDir)) {
-    // only the global directory needs to be migrated, which is why `ignoreWorkspace` is set to `true` here
+    console.log('[HSnips] Migrating from old global snippet directory...');
     const newSnippetDirInfo = getSnippetDirInfo(context, { ignoreWorkspace: true });
 
     if (newSnippetDirInfo.type == SnippetDirType.Global) {
       mkdirSync(path.dirname(newSnippetDirInfo.path), { recursive: true });
       renameSync(oldGlobalSnippetDir, newSnippetDirInfo.path);
+      console.log('[HSnips] Successfully migrated old global snippet directory');
     }
   }
 
-  loadSnippets(context);
+  // 延迟加载snippets，确保扩展完全激活
+  setTimeout(() => {
+    loadSnippets(context);
+  }, 100);
 
+  // 监听配置变化
   context.subscriptions.push(
-    vscode.commands.registerCommand('hsnips.openSnippetsDir', () =>
-      openExplorer(getSnippetDirInfo(context).path)
-    )
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('hsnips.hsnipsPath') ||
+        event.affectsConfiguration('hsnips.multiLineContext')) {
+        console.log('[HSnips] Configuration changed, reloading snippets...');
+        vscode.window.showInformationMessage('HSnips: Configuration changed, reloading snippets...');
+
+        // 清理现有监视器
+        if (snippetDirWatcher) {
+          snippetDirWatcher.dispose();
+          snippetDirWatcher = undefined;
+        }
+
+        // 重新加载snippets
+        loadSnippets(context);
+      }
+    })
+  );
+
+  // 注册命令
+  context.subscriptions.push(
+    vscode.commands.registerCommand('hsnips.openSnippetsDir', () => {
+      const snippetDirInfo = getSnippetDirInfo(context);
+      openExplorer(snippetDirInfo.path);
+    })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('hsnips.openSnippetFile', async () => {
       let snippetDirPath = getSnippetDirInfo(context).path;
-      let files = readdirSync(snippetDirPath);
+
+      if (!existsSync(snippetDirPath)) {
+        vscode.window.showWarningMessage('Snippet directory does not exist. Creating it now...');
+        mkdirSync(snippetDirPath, { recursive: true });
+        return;
+      }
+
+      let files = readdirSync(snippetDirPath).filter(f => f.endsWith('.hsnips'));
+
+      if (files.length === 0) {
+        vscode.window.showInformationMessage('No .hsnips files found in the snippet directory.');
+        return;
+      }
+
       let selectedFile = await vscode.window.showQuickPick(files);
 
       if (selectedFile) {
@@ -132,7 +304,11 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('hsnips.reloadSnippets', () => loadSnippets(context))
+    vscode.commands.registerCommand('hsnips.reloadSnippets', () => {
+      console.log('[HSnips] Manual reload triggered');
+      vscode.window.showInformationMessage('Reloading HSnips...');
+      loadSnippets(context);
+    })
   );
 
   context.subscriptions.push(
@@ -160,14 +336,17 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // 监听hsnips文件保存事件
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((document) => {
-      if (document.languageId == 'hsnips') {
+      if (document.languageId === 'hsnips') {
+        console.log(`[HSnips] Snippet file saved: ${document.fileName}`);
         loadSnippets(context);
       }
     })
   );
 
+  // 注册扩展命令
   context.subscriptions.push(
     vscode.commands.registerTextEditorCommand(
       'hsnips.expand',
@@ -177,10 +356,10 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // Forward all document changes so that the active snippet can update its related blocks.
+  // 文档内容变化监听器
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((e) => {
-      if (SNIPPET_STACK.length && SNIPPET_STACK[0].editor.document == e.document) {
+      if (SNIPPET_STACK.length && SNIPPET_STACK[0].editor.document === e.document) {
         SNIPPET_STACK[0].update(e.contentChanges);
       }
 
@@ -192,8 +371,8 @@ export function activate(context: vscode.ExtensionContext) {
 
       if (!mainChange) return;
 
-      // Let's try to detect only events that come from keystrokes.
-      if (mainChange.text.length != 1) return;
+      // 只处理单字符输入事件
+      if (mainChange.text.length !== 1) return;
 
       let snippets = SNIPPETS_BY_LANGUAGE.get(e.document.languageId.toLowerCase());
       if (!snippets) snippets = SNIPPETS_BY_LANGUAGE.get('all');
@@ -202,19 +381,23 @@ export function activate(context: vscode.ExtensionContext) {
       let mainChangePosition = mainChange.range.start.translate(0, mainChange.text.length);
       let completions = getCompletions(e.document, mainChangePosition, snippets);
 
-      // When an automatic completion is matched it is returned as an element, we check for this by
-      // using !isArray, and then expand the snippet.
+      // 自动完成匹配时展开snippet
       if (completions && !Array.isArray(completions)) {
         let editor = vscode.window.activeTextEditor;
-        if (editor && e.document == editor.document) {
-          expandSnippet(completions, editor);
+        if (editor && editor.document && e.document === editor.document) {
+          try {
+            expandSnippet(completions, editor);
+          } catch (error) {
+            console.error('[HSnips] Error during automatic snippet expansion:', error);
+            vscode.window.showErrorMessage(`HSnips: Failed to expand snippet - ${error}`);
+          }
           return;
         }
       }
     })
   );
 
-  // Remove any stale snippet instances.
+  // 清理过期的snippet实例
   context.subscriptions.push(
     vscode.window.onDidChangeVisibleTextEditors(() => {
       while (SNIPPET_STACK.length) SNIPPET_STACK.pop();
@@ -232,6 +415,7 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // 注册补全提供器
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       [{ pattern: '**' }],
@@ -241,8 +425,6 @@ export function activate(context: vscode.ExtensionContext) {
           if (!snippets) snippets = SNIPPETS_BY_LANGUAGE.get('all');
           if (!snippets) return;
 
-          // When getCompletions returns an array it means no auto-expansion was matched for the
-          // current context, in this case show the snippet list to the user.
           let completions = getCompletions(document, position, snippets);
           if (completions && Array.isArray(completions)) {
             return completions.map((c) => c.toCompletionItem());
@@ -252,4 +434,15 @@ export function activate(context: vscode.ExtensionContext) {
       ...COMPLETIONS_TRIGGERS
     )
   );
+
+  console.log('[HSnips] HyperSnips extension activated successfully');
+}
+
+/**
+ * 扩展停用时的清理函数
+ */
+export function deactivate() {
+  console.log('[HSnips] Deactivating HyperSnips extension...');
+  cleanup();
+  console.log('[HSnips] HyperSnips extension deactivated');
 }

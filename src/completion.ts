@@ -74,11 +74,20 @@ export function getCompletions(
 
   //FIXME: Plain text scope resolution should be fixed in hscopes.
   if (document.languageId !== 'plaintext') {
-    snippetContext = {
-      scopes: vscode.extensions
-        .getExtension('draivin.hscopes')!
-        .exports.getScopeAt(document, position).scopes,
-    };
+    try {
+      const hscopesExtension = vscode.extensions.getExtension('draivin.hscopes');
+      if (hscopesExtension && hscopesExtension.isActive && hscopesExtension.exports) {
+        const scopeResult = hscopesExtension.exports.getScopeAt(document, position);
+        if (scopeResult && scopeResult.scopes) {
+          snippetContext = {
+            scopes: scopeResult.scopes,
+          };
+        }
+      }
+    } catch (error) {
+      console.warn('[HSnips] Failed to get scopes from hscopes extension:', error);
+      // 继续使用默认的空 scopes 数组
+    }
   }
 
   for (let snippet of snippets) {
